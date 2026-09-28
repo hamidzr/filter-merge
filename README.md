@@ -202,7 +202,8 @@ Python 3.13. `just install` installs the native CLI through Cargo.
 
 Measured on an ARM64 GL-MT3000 router in September 2026:
 
-- Static stripped binary approximately 211 KiB.
+- Original custom size-optimized static binary approximately 211 KiB.
+- Published v0.1.1 ARM64 CI binary: 462,808 bytes (452 KiB), verified on the router.
 - Five sources: 12.64 MB input, 430,505 unique rules, 10.22 MB output, 5.35s rebuild.
 - Sampled combined server plus curl peak 11.3 MiB; includes HTTP client curl.
 - One million rules / 20 MB sorted output matched independently generated hash.
@@ -225,7 +226,9 @@ five-source build above were captured at different times; upstream list changes
 explain their different unique-rule counts. The 20.3% figure counts redundant
 exact rule occurrences, not semantically equivalent domains.
 
-These are workload measurements, not universal memory guarantees. AdGuard was
+Memory/workload figures above used the original custom build; release CI uses
+the standard Rust musl library, so its RSS has not been remeasured. These are
+workload measurements, not universal memory guarantees. AdGuard was
 also restarted, so observed AdGuard RSS changes do not isolate deduplication's
 benefit. Measure on your own lists and hardware.
 
