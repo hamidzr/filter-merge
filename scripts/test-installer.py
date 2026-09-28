@@ -3,10 +3,10 @@
 
 import hashlib
 import os
-from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+from pathlib import Path
 
 
 def main() -> None:
@@ -58,11 +58,14 @@ cp "$FIXTURE/${url##*/}" "$output"
         checks.write_text(f"{'0' * 64}  {archive.name}\n")
         failed = root / "failed"
         result = subprocess.run(
-            command[:-1] + [str(failed)], env=env, capture_output=True
+            command[:-1] + [str(failed)], env=env, capture_output=True, check=False
         )
         assert result.returncode != 0 and not failed.exists()
         result = subprocess.run(
-            command + ["--url", "file:///etc/passwd"], env=env, capture_output=True
+            command + ["--url", "file:///etc/passwd"],
+            env=env,
+            capture_output=True,
+            check=False,
         )
         assert result.returncode != 0
         print(

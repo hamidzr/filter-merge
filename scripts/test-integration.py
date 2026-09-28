@@ -59,7 +59,7 @@ def main() -> None:
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
