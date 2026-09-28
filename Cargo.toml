@@ -2,7 +2,7 @@
 build = "build.rs"
 edition = "2021"
 name = "filter-merge"
-version = "0.1.0"
+version = "0.1.1"
 rust-version = "1.89"
 license = "MIT"
 description = "Low-memory localhost HTTP filter-list merger for AdGuard Home"

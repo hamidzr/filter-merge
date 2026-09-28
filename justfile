@@ -18,6 +18,8 @@ test:
     cargo build --release
     uv run --python 3.13 python scripts/test-integration.py "${CARGO_TARGET_DIR:-target}/release/filter-merge"
 
+    python3 scripts/test-installer.py
+
 build-router:
     bash scripts/build-router.sh
 

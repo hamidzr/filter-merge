@@ -1,0 +1,73 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build and test
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          test "$TAG" = "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          export "CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER=musl-gcc"
+          cargo build --locked --release --target "$TARGET"
+          python3 scripts/test-integration.py "target/$TARGET/release/filter-merge"
+          file "target/$TARGET/release/filter-merge" | grep -E 'static(ally|-pie) linked'
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir package dist
+          cp "target/$TARGET/release/filter-merge" filter-merge.conf LICENSE package/
+          cp openwrt/filter-merge.init package/
+          tar -czf "dist/filter-merge-$TAG-$ARCH-linux-musl.tar.gz" -C package .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Publish verified binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp scripts/install.sh dist/install.sh
+          cd dist
+          sha256sum ./*.tar.gz | sed 's|  ./|  |' > SHA256SUMS
+          gh release create "$TAG" ./* --verify-tag --title "$TAG" --generate-notes

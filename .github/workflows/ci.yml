@@ -15,3 +15,4 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked --release
       - run: python3 scripts/test-integration.py target/release/filter-merge
+      - run: python3 scripts/test-installer.py

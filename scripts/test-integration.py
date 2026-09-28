@@ -163,7 +163,13 @@ def main() -> None:
                         base + "/healthz", timeout=1
                     ) as response:
                         metadata = response.read().decode()
-                    assert "filter-merge" in metadata and "0.1.0" in metadata
+                    assert (
+                        "filter-merge" in metadata
+                        and subprocess.check_output(
+                            [str(binary), "--version"], text=True
+                        ).split()[0]
+                        in metadata
+                    )
                     break
                 except (OSError, urllib.error.URLError):
                     time.sleep(0.05)

@@ -10,6 +10,33 @@ Useful on routers where overlapping subscriptions waste resources. This is an
 independent companion, not an AdGuard product or a replacement filtering engine.
 It does not eliminate AdGuard's own parsing/indexing memory or update spikes.
 
+## One-command OpenWrt setup
+
+Prebuilt static Linux binaries support ARM64 (`aarch64`) and AMD64 (`x86_64`).
+Other router architectures still require a source build. On OpenWrt, run as root
+with curl and CA certificates installed:
+
+```sh
+curl -fsSL https://github.com/hamidzr/filter-merge/releases/download/v0.1.1/install.sh | sh -s -- --url https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
+```
+
+Repeat `--url URL` for each of your existing subscriptions. Installer verifies
+binary SHA-256, installs the procd boot service, and uses `/overlay` for staging.
+Then add `http://127.0.0.1:3054/filters.txt` in AdGuard's DNS blocklists. Once it
+downloads successfully, disable the original subscriptions included in the merger.
+Installer does not edit AdGuard settings. Without `--url`, a new installation
+uses only the default AdGuard DNS source. Existing config is preserved on upgrades;
+edit `/etc/filter-merge.conf` and restart to change sources.
+
+For inspection before execution, download `install.sh`, read it, then run it.
+For other Linux systems, append `--download-only ./filter-merge-bin` to download
+verified files without installing a service. Configure your OS service manager
+as described below. Native macOS builds remain available from source.
+
+GitHub Actions builds and tests both architectures before publishing tag releases.
+Release assets include the installer, archives, and `SHA256SUMS`. Checksums detect
+corruption; they are not an independent signature of the GitHub publisher.
+
 ## Quick start (Linux or macOS)
 
 Requires Rust 1.89+, curl, and a Unix filesystem. Windows is not supported.
@@ -179,6 +206,24 @@ Measured on an ARM64 GL-MT3000 router in September 2026:
 - Five sources: 12.64 MB input, 430,505 unique rules, 10.22 MB output, 5.35s rebuild.
 - Sampled combined server plus curl peak 11.3 MiB; includes HTTP client curl.
 - One million rules / 20 MB sorted output matched independently generated hash.
+
+Recorded five-list comparison before deployment (same snapshot, exact rules):
+
+| Metric | Recorded result |
+| --- | --- |
+| Rule occurrences across five lists | 545,734 |
+| Unique exact rules | 434,948 |
+| Redundant occurrences removed | 110,786 (20.3%) |
+| AdGuard RSS before activation | 139,948 KiB (136.7 MiB) |
+| AdGuard RSS immediately after activation and restart | 97,272 KiB (95.0 MiB) |
+| Immediate observed RSS decrease | 42,676 KiB (41.7 MiB), 30.5% |
+| Later warmed AdGuard RSS | 122,580 KiB (119.7 MiB) |
+| Later observed RSS decrease from pre-activation sample | 17,368 KiB (17.0 MiB), 12.4% |
+
+Post-activation samples had no swap. The historical duplicate snapshot and live
+five-source build above were captured at different times; upstream list changes
+explain their different unique-rule counts. The 20.3% figure counts redundant
+exact rule occurrences, not semantically equivalent domains.
 
 These are workload measurements, not universal memory guarantees. AdGuard was
 also restarted, so observed AdGuard RSS changes do not isolate deduplication's
