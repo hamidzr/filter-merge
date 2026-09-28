@@ -1,0 +1,16 @@
+[package]
+build = "build.rs"
+edition = "2021"
+name = "filter-merge"
+version = "0.1.0"
+rust-version = "1.89"
+license = "MIT"
+description = "Low-memory localhost HTTP filter-list merger for AdGuard Home"
+repository = "https://github.com/hamidzr/filter-merge"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
