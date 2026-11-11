@@ -238,11 +238,12 @@ impl Seen {
         }
         self.dirty |= self.map.len() != before;
     }
-    /// Every recorded name plus all of its parent domains.
-    pub fn suffixes(&self, min_queries: u64) -> NameSet {
+    /// Every name with enough queries, last seen on or after `oldest_day`,
+    /// plus all of its parent domains.
+    pub fn suffixes(&self, min_queries: u64, oldest_day: u32) -> NameSet {
         let mut set = NameSet::default();
         for (name, record) in &self.map {
-            if record.queries < min_queries {
+            if record.queries < min_queries || record.last_day < oldest_day {
                 continue;
             }
             let mut rest = name.as_str();
@@ -593,7 +594,7 @@ mod tests {
                 blocked: 1
             })
         );
-        let suffixes = seen.suffixes(1);
+        let suffixes = seen.suffixes(1, 12);
         for name in [
             "sub.ads.example.com",
             "ads.example.com",
@@ -603,7 +604,9 @@ mod tests {
             assert!(suffixes.contains(name.as_bytes()), "{name}");
         }
         assert!(!suffixes.contains(b"other.example.com"));
-        assert!(seen.suffixes(3).is_empty());
+        assert!(seen.suffixes(3, 0).is_empty());
+        // last seen on day 12, so a window starting on day 13 no longer serves it
+        assert!(seen.suffixes(1, 13).is_empty());
     }
     #[test]
     fn seen_round_trips_and_prunes() {

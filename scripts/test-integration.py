@@ -203,7 +203,7 @@ def main() -> None:
         configure(
             ["/a", "/b"],
             extra=f"state_dir={state}\nadguard_api={source_base}\nadaptive=1\n"
-            "observe_interval_secs=1\nstate_flush_secs=1\nrefresh_secs=1\n",
+            "observe_interval_secs=1\nstate_flush_secs=1\nrefresh_secs=1\ncheck_secs=1\n",
         )
         counts.clear()
         process = subprocess.Popen(
@@ -244,6 +244,12 @@ def main() -> None:
                 *adaptive,
             ]
             assert counts == {"/a": 1, "/b": 1}, counts
+            # a new name that matches no rule must not spend a refresh
+            query_log.insert(0, entry(4, "harmless.example", "NotFilteredNotFound"))
+            wait_for(lambda: stats()["observed_names"] == "5", "name not observed")
+            polls = int(stats()["polls"])
+            wait_for(lambda: int(stats()["polls"]) >= polls + 3, "observer stopped")
+            assert stats()["refreshes"] == "2" and len(refresh_fetches) == 2, stats()
             wait_for(
                 lambda: "exact.example\t" in (state / "seen.tsv").read_text(),
                 "store not flushed",

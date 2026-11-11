@@ -185,10 +185,12 @@ Both are optional. Without these keys the service behaves as described above.
 | `state_flush_secs` | `3600` | How often the store is written to disk |
 | `adaptive` | `0` | `1` serves only rules that can match an observed name |
 | `adaptive_min_queries` | `1` | Queries a name needs before its rules are served |
+| `adaptive_max_age_days` | `90` | Stop serving rules for names not seen this long; `0` never stops |
+| `check_secs` | `300` | Shortest gap between checks for a changed list |
 | `seen_max_age_days` | `0` | Forget names not seen for this long; `0` keeps them |
 | `seen_max_entries` | `200000` | Store cap; least recently seen names go first |
 | `candidate_max_age_hours` | `168` | Re-download sources after this long in adaptive mode |
-| `refresh_secs` | `3600` | Shortest gap between AdGuard refresh requests |
+| `refresh_secs` | `21600` | Shortest gap between AdGuard refresh requests, 6 hours |
 
 **Exclude list.** A rule is dropped only when it is a plain `||domain^`, hosts or
 bare-domain rule and its domain is listed. Exceptions and rules with modifiers
@@ -206,16 +208,29 @@ missed and `/stats` counts a gap. The first poll after a restart recounts the
 entries still in that buffer.
 
 **Adaptive mode.** A resolver only needs rules for names its clients ask for, so
-a 400,000-rule merge usually shrinks to a few thousand rules and AdGuard's memory
-drops with it. A rule is served when its domain is an observed name or a parent
+a large merge shrinks to the rules for names actually in use, and AdGuard's
+memory drops with it. A rule is served when its domain is an observed name or a parent
 of one. Rules without a plain domain (regexes, wildcards) are always served.
-The full merge is cached as `work_dir/candidate.txt`. When new names have been
-recorded, the observer asks AdGuard to refresh, at most once per `refresh_secs`,
-and AdGuard reloads only if the list changed.
+The full merge is cached as `work_dir/candidate.txt`.
+
+Timing, with the defaults:
+
+| Event | When it takes effect |
+| --- | --- |
+| A blockable name is queried for the first time | Recorded within a minute. Blocked from the next refresh: about 5 minutes later if no refresh ran in the last 6 hours, otherwise when that 6 hours is up |
+| A name stops being queried | Its rules are served for 90 more days, then leave at the first refresh after that |
+| A dropped name is queried again | Same as a first query. Its history is still in the store |
+| A name is never queried | Its rules are never served. It stays in the cached merge on disk |
+
+The store itself is kept indefinitely, up to `seen_max_entries`. Every query,
+blocked or not, renews a name's 90 days, so rules in active use never expire.
+The observer asks AdGuard to refresh only when the list it would serve differs
+from the one last served, so names that match no rule do not use up a refresh.
+AdGuard's own update schedule still applies on top.
 
 The cost is the first query: a name nobody on the network has asked for before
-is not blocked until the next refresh picks it up. Run the observer alone for a
-while before setting `adaptive=1`, and preview the result with
+is not blocked until that next refresh. Run the observer alone for a while
+before setting `adaptive=1`, and preview the result with
 `merge CONFIG OUTPUT --adaptive`. An adaptive build with no surviving rules
 fails with 502, so AdGuard keeps its previous list.
 

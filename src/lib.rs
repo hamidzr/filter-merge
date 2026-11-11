@@ -49,6 +49,9 @@ pub struct Config {
     /// Serve only rules that could match an observed name.
     pub adaptive: bool,
     pub adaptive_min_queries: u64,
+    /// Stop serving rules for names not seen for this many days; 0 never stops.
+    pub adaptive_max_age_days: u32,
+    pub check_secs: u64,
     pub seen_max_age_days: u32,
     pub seen_max_entries: usize,
     pub candidate_max_age_hours: u64,
@@ -76,10 +79,12 @@ impl Default for Config {
             state_flush_secs: 3600,
             adaptive: false,
             adaptive_min_queries: 1,
+            adaptive_max_age_days: 90,
+            check_secs: 300,
             seen_max_age_days: 0,
             seen_max_entries: 200_000,
             candidate_max_age_hours: 168,
-            refresh_secs: 3600,
+            refresh_secs: 21_600,
         }
     }
 }
@@ -138,6 +143,8 @@ impl Config {
                 "state_flush_secs" => number!(state_flush_secs),
                 "adaptive" => config.adaptive = flag()?,
                 "adaptive_min_queries" => number!(adaptive_min_queries),
+                "adaptive_max_age_days" => number!(adaptive_max_age_days),
+                "check_secs" => number!(check_secs),
                 "seen_max_age_days" => number!(seen_max_age_days),
                 "seen_max_entries" => number!(seen_max_entries),
                 "candidate_max_age_hours" => number!(candidate_max_age_hours),
@@ -212,6 +219,7 @@ impl Config {
         if config.observe_interval_secs == 0
             || config.state_flush_secs == 0
             || config.refresh_secs == 0
+            || config.check_secs == 0
             || config.seen_max_entries == 0
             || config.seen_max_entries > 2_000_000
             || config.candidate_max_age_hours == 0
@@ -267,6 +275,8 @@ pub struct Stats {
     pub input_bytes: u64,
     pub output_bytes: u64,
     pub rules: u64,
+    /// Hash of the trimmed output; 0 when nothing was trimmed.
+    pub fingerprint: u64,
 }
 struct Chunk {
     arena: Vec<u8>,
@@ -630,11 +640,7 @@ fn produce(config: &Config, observed: Option<&NameSet>) -> Result<Build> {
         }
         (None, _) => build(config)?,
     };
-    let exclude = config
-        .exclude_file
-        .as_deref()
-        .map(|path| NameSet::load(path, config.max_input_bytes))
-        .transpose()?;
+    let exclude = load_exclude(config)?;
     if exclude.is_none() && observed.is_none() {
         return Ok(build);
     }
@@ -647,16 +653,11 @@ fn produce(config: &Config, observed: Option<&NameSet>) -> Result<Build> {
     let mut line = Vec::with_capacity(config.max_line_bytes + 2);
     build.stats.rules = 0;
     build.stats.output_bytes = 0;
+    build.stats.fingerprint = FNV_OFFSET;
     while read_line(&mut reader, &mut line, config.max_line_bytes)? > 0 {
         let rule = line.strip_suffix(b"\n").unwrap_or(&line);
-        let keep = adaptive::rule_domain(rule).is_none_or(|found| {
-            !(found.plain
-                && exclude
-                    .as_ref()
-                    .is_some_and(|set| set.contains(found.domain)))
-                && observed.is_none_or(|set| set.contains(found.domain))
-        });
-        if keep {
+        if keeps(rule, exclude.as_ref(), observed) {
+            build.stats.fingerprint = fnv(build.stats.fingerprint, &line);
             writer
                 .write_all(&line)
                 .map_err(|_| "cannot write trimmed list")?;
@@ -672,12 +673,57 @@ fn produce(config: &Config, observed: Option<&NameSet>) -> Result<Build> {
     build.output = trimmed;
     Ok(build)
 }
+fn keeps(rule: &[u8], exclude: Option<&NameSet>, observed: Option<&NameSet>) -> bool {
+    adaptive::rule_domain(rule).is_none_or(|found| {
+        !(found.plain && exclude.is_some_and(|set| set.contains(found.domain)))
+            && observed.is_none_or(|set| set.contains(found.domain))
+    })
+}
+fn load_exclude(config: &Config) -> Result<Option<NameSet>> {
+    config
+        .exclude_file
+        .as_deref()
+        .map(|path| NameSet::load(path, config.max_input_bytes))
+        .transpose()
+}
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+fn fnv(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+/// Hash the list adaptive mode would serve now, without writing it.
+/// `None` when no merged candidates are cached yet.
+fn adaptive_fingerprint(config: &Config, observed: &NameSet) -> Result<Option<u64>> {
+    let Ok(file) = File::open(config.work_dir.join("candidate.txt")) else {
+        return Ok(None);
+    };
+    let exclude = load_exclude(config)?;
+    let mut reader = BufReader::with_capacity(8192, file);
+    let mut line = Vec::with_capacity(config.max_line_bytes + 2);
+    let mut hash = FNV_OFFSET;
+    while read_line(&mut reader, &mut line, config.max_line_bytes)? > 0 {
+        let rule = line.strip_suffix(b"\n").unwrap_or(&line);
+        if keeps(rule, exclude.as_ref(), Some(observed)) {
+            hash = fnv(hash, &line);
+        }
+    }
+    Ok(Some(hash))
+}
+/// Names whose rules adaptive mode serves today.
+fn observed_names(config: &Config, seen: &Seen) -> NameSet {
+    let oldest = match config.adaptive_max_age_days {
+        0 => 0,
+        days => adaptive::today().saturating_sub(days),
+    };
+    seen.suffixes(config.adaptive_min_queries, oldest)
+}
 fn seen_path(config: &Config) -> Option<PathBuf> {
     config.state_dir.as_ref().map(|dir| dir.join("seen.tsv"))
 }
 pub fn merge(config: &Config, output: &Path) -> Result<Stats> {
     let observed = match (config.adaptive, seen_path(config)) {
-        (true, Some(path)) => Some(Seen::load(&path)?.suffixes(config.adaptive_min_queries)),
+        (true, Some(path)) => Some(observed_names(config, &Seen::load(&path)?)),
         _ => None,
     };
     let build = produce(config, observed.as_ref())?;
@@ -768,6 +814,8 @@ struct State {
     gaps: u64,
     refreshes: u64,
     last_error: String,
+    /// Fingerprint of the adaptive list most recently served.
+    served: Option<u64>,
 }
 type Shared = Arc<Mutex<State>>;
 fn locked(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
@@ -778,7 +826,10 @@ fn locked(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
 /// Poll the query log forever; flush the store and nudge AdGuard on a schedule.
 fn observe(config: Config, shared: Shared, mut observer: Observer, store: PathBuf) {
     let mut last_flush = Instant::now();
-    let mut last_refresh = Instant::now();
+    // None: no refresh requested yet, so the first change may go out at once.
+    let mut last_refresh: Option<Instant> = None;
+    let mut last_check = Instant::now();
+    let mut checked_day = adaptive::today();
     loop {
         std::thread::sleep(Duration::from_secs(config.observe_interval_secs));
         let mut state = locked(&shared);
@@ -807,20 +858,37 @@ fn observe(config: Config, shared: Shared, mut observer: Observer, store: PathBu
                 }
             }
         }
-        let refresh = config.adaptive
-            && state.seen.fresh
-            && last_refresh.elapsed().as_secs() >= config.refresh_secs;
+        // New names can add rules; a new day can expire some. Only then, and only
+        // once the refresh budget is open, work out whether the list would change.
+        let day = adaptive::today();
+        let due = config.adaptive
+            && (state.seen.fresh || day != checked_day)
+            && last_check.elapsed().as_secs() >= config.check_secs
+            && last_refresh.is_none_or(|at| at.elapsed().as_secs() >= config.refresh_secs);
+        if !due {
+            continue;
+        }
+        last_check = Instant::now();
+        checked_day = day;
+        state.seen.fresh = false;
+        let observed = observed_names(&config, &state.seen);
+        let served = state.served;
         // AdGuard fetches from this process while refreshing; never hold the lock.
         drop(state);
-        if refresh {
-            last_refresh = Instant::now();
-            let result = observer.refresh_filters();
-            let mut state = locked(&shared);
-            state.refreshes += 1;
-            if let Err(error) = result {
-                state.errors += 1;
-                state.last_error = error;
+        let result = match adaptive_fingerprint(&config, &observed) {
+            Ok(fingerprint) if fingerprint.is_some() && fingerprint == served => continue,
+            Ok(_) => {
+                drop(observed);
+                last_refresh = Some(Instant::now());
+                locked(&shared).refreshes += 1;
+                observer.refresh_filters()
             }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            let mut state = locked(&shared);
+            state.errors += 1;
+            state.last_error = error;
         }
     }
 }
@@ -909,12 +977,15 @@ pub fn serve(config: Config) -> Result<()> {
             (Some(shared), true) => {
                 let mut state = locked(shared);
                 state.seen.fresh = false;
-                Some(state.seen.suffixes(config.adaptive_min_queries))
+                Some(observed_names(&config, &state.seen))
             }
             _ => None,
         };
         let result = produce(&config, observed.as_ref());
         drop(observed);
+        if let (Some(shared), true, Ok(build)) = (&shared, config.adaptive, &result) {
+            locked(shared).served = Some(build.stats.fingerprint);
+        }
         if let Ok(build) = &result {
             eprintln!(
                 "filter-merge: input_bytes={} rules={} output_bytes={}",
