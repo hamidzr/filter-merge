@@ -826,6 +826,8 @@ fn locked(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
 /// Poll the query log forever; flush the store and nudge AdGuard on a schedule.
 fn observe(config: Config, shared: Shared, mut observer: Observer, store: PathBuf) {
     let mut last_flush = Instant::now();
+    // Write a new store right after its first poll, not an hour later.
+    let mut stored = store.exists();
     // None: no refresh requested yet, so the first change may go out at once.
     let mut last_refresh: Option<Instant> = None;
     let mut last_check = Instant::now();
@@ -844,8 +846,11 @@ fn observe(config: Config, shared: Shared, mut observer: Observer, store: PathBu
                 state.last_error = error;
             }
         }
-        if last_flush.elapsed().as_secs() >= config.state_flush_secs {
+        if last_flush.elapsed().as_secs() >= config.state_flush_secs
+            || (!stored && !state.seen.is_empty())
+        {
             last_flush = Instant::now();
+            stored = true;
             state.seen.prune(
                 adaptive::today(),
                 config.seen_max_age_days,

@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -54,7 +55,12 @@ def main() -> None:
 
         def do_GET(self) -> None:
             if self.path.startswith("/control/querylog"):
-                body = json.dumps({"data": query_log, "oldest": ""}).encode()
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                before = query.get("older_than", ["~"])[0]
+                page = [item for item in query_log if str(item["time"]) < before]
+                page = page[: int(query["limit"][0])]
+                oldest = page[-1]["time"] if page else ""
+                body = json.dumps({"data": page, "oldest": oldest}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -189,7 +195,7 @@ def main() -> None:
         def entry(stamp: int, name: str, reason: str, cname: str = "") -> dict:
             answer = [{"type": "CNAME", "value": cname}] if cname else []
             return {
-                "time": f"2026-01-01T00:00:{stamp:02d}Z",
+                "time": f"2026-01-01T00:00:{stamp:02d}Z" if stamp else name,
                 "question": {"name": name, "type": "A"},
                 "reason": reason,
                 "answer": answer,
@@ -198,6 +204,11 @@ def main() -> None:
         query_log[:] = [
             entry(2, "site.example", "NotFilteredNotFound", "cdn.wild.example."),
             entry(1, "A.example", "FilteredBlackList"),
+        ]
+        # older history than one shallow poll reads; a new store takes all of it
+        query_log += [
+            entry(0, f"1999-{number:04d}.test", "NotFilteredNotFound")
+            for number in range(1200, 0, -1)
         ]
         served_from.append(f"http://127.0.0.1:{port}/filters.txt")
         configure(
@@ -233,10 +244,10 @@ def main() -> None:
                 "||wild.example^$dnsrewrite=NOERROR;A;0.0.0.0",
             ]
             assert refresh_fetches[0].decode().splitlines() == adaptive
-            assert stats()["observed_names"] == "3", stats()
+            assert stats()["observed_names"] == "1203", stats()
             # a repeated poll must not recount entries it already saw
             wait_for(lambda: int(stats()["polls"]) >= 3, "observer stopped")
-            assert stats()["entries"] == "2" and stats()["errors"] == "0", stats()
+            assert stats()["entries"] == "1202" and stats()["errors"] == "0", stats()
             query_log.insert(0, entry(3, "exact.example", "NotFilteredNotFound"))
             wait_for(lambda: len(refresh_fetches) >= 2, "new name did not refresh")
             assert refresh_fetches[-1].decode().splitlines() == [
@@ -246,7 +257,7 @@ def main() -> None:
             assert counts == {"/a": 1, "/b": 1}, counts
             # a new name that matches no rule must not spend a refresh
             query_log.insert(0, entry(4, "harmless.example", "NotFilteredNotFound"))
-            wait_for(lambda: stats()["observed_names"] == "5", "name not observed")
+            wait_for(lambda: stats()["observed_names"] == "1205", "name not observed")
             polls = int(stats()["polls"])
             wait_for(lambda: int(stats()["polls"]) >= polls + 3, "observer stopped")
             assert stats()["refreshes"] == "2" and len(refresh_fetches) == 2, stats()

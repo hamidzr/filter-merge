@@ -205,7 +205,9 @@ browsing history of the network, so it is written with mode 0600; treat backups
 of it the same way. With `file_enabled: false`, AdGuard keeps only its last
 `size_memory` queries (1000 by default). If more arrive between polls, some are
 missed and `/stats` counts a gap. The first poll after a restart recounts the
-entries still in that buffer.
+entries still in that buffer. A new, empty store is seeded from all the history
+AdGuard still has, up to 50,000 queries, and written to disk straight away, so
+with a file-backed query log adaptive mode can start from days of history.
 
 **Adaptive mode.** A resolver only needs rules for names its clients ask for, so
 a large merge shrinks to the rules for names actually in use, and AdGuard's

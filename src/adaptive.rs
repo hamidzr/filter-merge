@@ -18,6 +18,8 @@ type Result<T> = std::result::Result<T, String>;
 const GLINET_TOKEN_PREFIX: &str = "/tmp/gl_token_";
 const PAGE_ENTRIES: usize = 200;
 const MAX_PAGES: usize = 5;
+/// An empty store reads the whole available log once: 50,000 entries at most.
+const BOOTSTRAP_PAGES: usize = 250;
 const MAX_PAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn today() -> u32 {
@@ -461,7 +463,14 @@ impl Observer {
         let mut newest = None;
         let mut older_than = String::new();
         let mut reached = false;
-        'pages: for _ in 0..MAX_PAGES {
+        // Seed a new store from all the history AdGuard still has. Later polls
+        // stay shallow, so a restart recounts little.
+        let pages = if seen.is_empty() && self.watermark.is_none() {
+            BOOTSTRAP_PAGES
+        } else {
+            MAX_PAGES
+        };
+        'pages: for _ in 0..pages {
             let mut url = format!("{}/control/querylog?limit={PAGE_ENTRIES}", self.api);
             if !older_than.is_empty() {
                 url.push_str(&format!("&older_than={}", older_than.replace('+', "%2B")));
