@@ -2,7 +2,7 @@
 set -eu
 
 # Install only on OpenWrt; download-only supports other Linux systems.
-release=v0.2.0
+release=v0.2.1
 base="https://github.com/hamidzr/filter-merge/releases/download/$release"
 download_dir=
 urls=
