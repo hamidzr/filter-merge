@@ -35,8 +35,31 @@ def main() -> None:
         "/slow": b"||slow.example^\n",
     }
 
+    # fake AdGuard Home query log, newest first
+    query_log: list[dict[str, object]] = []
+    refresh_fetches: list[bytes] = []
+    served_from: list[str] = []
+
     class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            assert self.path == "/control/filtering/refresh", self.path
+            self.rfile.read(int(self.headers["Content-Length"]))
+            # AdGuard fetches its subscription while the refresh call is open
+            with urllib.request.urlopen(served_from[0], timeout=10) as response:
+                refresh_fetches.append(response.read())
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
         def do_GET(self) -> None:
+            if self.path.startswith("/control/querylog"):
+                body = json.dumps({"data": query_log, "oldest": ""}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             counts[self.path] = counts.get(self.path, 0) + 1
             if self.path == "/million":
                 self.send_response(200)
@@ -147,6 +170,102 @@ def main() -> None:
         assert lines == 1_000_000, lines
         results.append(
             f"million-line chunked merge passed in {time.monotonic() - started:.2f}s"
+        )
+
+        exclude = root / "exclude.txt"
+        exclude.write_text("# dead\nZ.example\nallowed.example\nwild.example\n")
+        configure(["/a", "/b"], extra=f"exclude_file={exclude}\n")
+        merge_ok()
+        assert output.read_text().splitlines() == [
+            "0.0.0.0 exact.example",
+            "@@||allowed.example^$important",
+            "||a.example^",
+            "||wild.example^$dnsrewrite=NOERROR;A;0.0.0.0",
+        ], output.read_text()
+        results.append("exclude list drops plain rules only")
+
+        state = root / "state"
+
+        def entry(stamp: int, name: str, reason: str, cname: str = "") -> dict:
+            answer = [{"type": "CNAME", "value": cname}] if cname else []
+            return {
+                "time": f"2026-01-01T00:00:{stamp:02d}Z",
+                "question": {"name": name, "type": "A"},
+                "reason": reason,
+                "answer": answer,
+            }
+
+        query_log[:] = [
+            entry(2, "site.example", "NotFilteredNotFound", "cdn.wild.example."),
+            entry(1, "A.example", "FilteredBlackList"),
+        ]
+        served_from.append(f"http://127.0.0.1:{port}/filters.txt")
+        configure(
+            ["/a", "/b"],
+            extra=f"state_dir={state}\nadguard_api={source_base}\nadaptive=1\n"
+            "observe_interval_secs=1\nstate_flush_secs=1\nrefresh_secs=1\n",
+        )
+        counts.clear()
+        process = subprocess.Popen(
+            [str(binary), "serve", str(config)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+
+            def stats() -> dict[str, str]:
+                with urllib.request.urlopen(base + "/stats", timeout=2) as response:
+                    lines = response.read().decode().splitlines()
+                return dict(line.split("=", 1) for line in lines)
+
+            def wait_for(check, what: str) -> None:
+                for _ in range(200):
+                    with contextlib.suppress(OSError, urllib.error.URLError):
+                        if check():
+                            return
+                    time.sleep(0.05)
+                raise AssertionError(what)
+
+            wait_for(lambda: refresh_fetches, "no refresh after new names")
+            adaptive = [
+                "||a.example^",
+                "||wild.example^$dnsrewrite=NOERROR;A;0.0.0.0",
+            ]
+            assert refresh_fetches[0].decode().splitlines() == adaptive
+            assert stats()["observed_names"] == "3", stats()
+            # a repeated poll must not recount entries it already saw
+            wait_for(lambda: int(stats()["polls"]) >= 3, "observer stopped")
+            assert stats()["entries"] == "2" and stats()["errors"] == "0", stats()
+            query_log.insert(0, entry(3, "exact.example", "NotFilteredNotFound"))
+            wait_for(lambda: len(refresh_fetches) >= 2, "new name did not refresh")
+            assert refresh_fetches[-1].decode().splitlines() == [
+                "0.0.0.0 exact.example",
+                *adaptive,
+            ]
+            assert counts == {"/a": 1, "/b": 1}, counts
+            wait_for(
+                lambda: "exact.example\t" in (state / "seen.tsv").read_text(),
+                "store not flushed",
+            )
+            store = (state / "seen.tsv").read_text()
+            assert "a.example\t" in store and "cdn.wild.example\t" in store, store
+            assert (state / "seen.tsv").stat().st_mode & 0o777 == 0o600
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+        configure(["/a", "/b"], extra=f"state_dir={state}\n")
+        subprocess.run(
+            [str(binary), "merge", str(config), str(output), "--adaptive"],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        assert output.read_text().splitlines() == ["0.0.0.0 exact.example", *adaptive]
+        merge_ok()
+        assert len(output.read_text().splitlines()) == 5
+        results.append(
+            "observer learns names and CNAMEs, adaptive list follows, cached candidates reused"
         )
 
         configure(["/slow"])

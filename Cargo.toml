@@ -2,7 +2,7 @@
 build = "build.rs"
 edition = "2021"
 name = "filter-merge"
-version = "0.1.1"
+version = "0.2.0"
 rust-version = "1.89"
 license = "MIT"
 description = "Low-memory localhost HTTP filter-list merger for AdGuard Home"
@@ -14,3 +14,6 @@ lto = true
 opt-level = "z"
 panic = "abort"
 strip = true
+
+[dependencies]
+serde_json = { version = "1", default-features = false, features = ["std"] }

@@ -1,3 +1,6 @@
+pub mod adaptive;
+
+use adaptive::{NameSet, Observer, Seen};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
@@ -7,7 +10,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -33,6 +37,22 @@ pub struct Config {
     pub download_timeout_secs: u64,
     pub build_timeout_secs: u64,
     pub urls: Vec<String>,
+    /// Domains whose plain rules are dropped from the output.
+    pub exclude_file: Option<PathBuf>,
+    /// Holds the observed-domain store; required for observation.
+    pub state_dir: Option<PathBuf>,
+    /// AdGuard Home base URL; setting it turns observation on.
+    pub adguard_api: Option<String>,
+    pub glinet_session: bool,
+    pub observe_interval_secs: u64,
+    pub state_flush_secs: u64,
+    /// Serve only rules that could match an observed name.
+    pub adaptive: bool,
+    pub adaptive_min_queries: u64,
+    pub seen_max_age_days: u32,
+    pub seen_max_entries: usize,
+    pub candidate_max_age_hours: u64,
+    pub refresh_secs: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -48,6 +68,18 @@ impl Default for Config {
             download_timeout_secs: 20,
             build_timeout_secs: 55,
             urls: Vec::new(),
+            exclude_file: None,
+            state_dir: None,
+            adguard_api: None,
+            glinet_session: false,
+            observe_interval_secs: 60,
+            state_flush_secs: 3600,
+            adaptive: false,
+            adaptive_min_queries: 1,
+            seen_max_age_days: 0,
+            seen_max_entries: 200_000,
+            candidate_max_age_hours: 168,
+            refresh_secs: 3600,
         }
     }
 }
@@ -82,6 +114,11 @@ impl Config {
                         .map_err(|_| concat!("invalid ", stringify!($field)))?
                 };
             }
+            let flag = || match value {
+                "0" => Ok(false),
+                "1" => Ok(true),
+                _ => Err("flags must be 0 or 1"),
+            };
             match key.trim() {
                 "listen" => config.listen = value.parse().map_err(|_| "invalid listen address")?,
                 "work_dir" => config.work_dir = value.into(),
@@ -93,6 +130,18 @@ impl Config {
                 "max_run_files" => number!(max_run_files),
                 "download_timeout_secs" => number!(download_timeout_secs),
                 "build_timeout_secs" => number!(build_timeout_secs),
+                "exclude_file" => config.exclude_file = Some(value.into()),
+                "state_dir" => config.state_dir = Some(value.into()),
+                "adguard_api" => config.adguard_api = Some(value.into()),
+                "glinet_session" => config.glinet_session = flag()?,
+                "observe_interval_secs" => number!(observe_interval_secs),
+                "state_flush_secs" => number!(state_flush_secs),
+                "adaptive" => config.adaptive = flag()?,
+                "adaptive_min_queries" => number!(adaptive_min_queries),
+                "seen_max_age_days" => number!(seen_max_age_days),
+                "seen_max_entries" => number!(seen_max_entries),
+                "candidate_max_age_hours" => number!(candidate_max_age_hours),
+                "refresh_secs" => number!(refresh_secs),
                 "url" => {
                     if !(value.starts_with("https://") || value.starts_with("http://"))
                         || value.chars().any(char::is_whitespace)
@@ -139,6 +188,35 @@ impl Config {
         }
         if !config.work_dir.is_absolute() {
             return Err("work_dir must be absolute".into());
+        }
+        if [&config.exclude_file, &config.state_dir]
+            .into_iter()
+            .flatten()
+            .any(|path| !path.is_absolute())
+        {
+            return Err("exclude_file and state_dir must be absolute".into());
+        }
+        if let Some(api) = &config.adguard_api {
+            // The observer sends a session cookie; never let it leave the host.
+            let host = api.strip_prefix("http://").unwrap_or_default();
+            if !host
+                .parse::<SocketAddr>()
+                .is_ok_and(|address| address.ip().is_loopback())
+            {
+                return Err("adguard_api must be http://LOOPBACK:PORT".into());
+            }
+        }
+        if (config.adguard_api.is_some() || config.adaptive) && config.state_dir.is_none() {
+            return Err("observation and adaptive mode require state_dir".into());
+        }
+        if config.observe_interval_secs == 0
+            || config.state_flush_secs == 0
+            || config.refresh_secs == 0
+            || config.seen_max_entries == 0
+            || config.seen_max_entries > 2_000_000
+            || config.candidate_max_age_hours == 0
+        {
+            return Err("invalid observation limits".into());
         }
         Ok(config)
     }
@@ -395,7 +473,8 @@ struct Build {
     stats: Stats,
     _lock: File,
 }
-fn build(config: &Config) -> Result<Build> {
+/// Take the build lock, clear abandoned staging and open a fresh workspace.
+fn stage(config: &Config) -> Result<(File, Workspace)> {
     fs::create_dir_all(&config.work_dir).map_err(|_| "cannot create work directory")?;
     let lock = OpenOptions::new()
         .read(true)
@@ -427,7 +506,10 @@ fn build(config: &Config) -> Result<Build> {
             fs::remove_dir_all(entry.path()).map_err(|_| "cannot clean abandoned staging")?;
         }
     }
-    let workspace = Workspace::new(&config.work_dir)?;
+    Ok((lock, Workspace::new(&config.work_dir)?))
+}
+fn build(config: &Config) -> Result<Build> {
+    let (lock, workspace) = stage(config)?;
     let deadline = Instant::now() + Duration::from_secs(config.build_timeout_secs);
     let mut chunk = Chunk::new(config.chunk_bytes);
     let mut runs = Vec::new();
@@ -504,8 +586,101 @@ fn build(config: &Config) -> Result<Build> {
         _lock: lock,
     })
 }
+fn cached_candidate(config: &Config) -> Option<PathBuf> {
+    let path = config.work_dir.join("candidate.txt");
+    let age = fs::metadata(&path).ok()?.modified().ok()?;
+    let limit = Duration::from_secs(config.candidate_max_age_hours * 3600);
+    (SystemTime::now().duration_since(age).unwrap_or_default() < limit).then_some(path)
+}
+/// Merge the sources, then drop excluded rules and, when `observed` is given,
+/// every domain rule that cannot match an observed name.
+fn produce(config: &Config, observed: Option<&NameSet>) -> Result<Build> {
+    let mut build = match (observed, cached_candidate(config)) {
+        // Adaptive rebuilds are frequent; reuse the downloaded merge between them.
+        (Some(_), Some(candidate)) => {
+            let (lock, workspace) = stage(config)?;
+            Build {
+                workspace,
+                output: candidate,
+                stats: Stats::default(),
+                _lock: lock,
+            }
+        }
+        (Some(_), None) => {
+            let candidate = config.work_dir.join("candidate.txt");
+            match build(config) {
+                Ok(mut build) => {
+                    fs::rename(&build.output, &candidate)
+                        .map_err(|_| "cannot cache merged candidates")?;
+                    build.output = candidate;
+                    build
+                }
+                Err(error) if candidate.exists() => {
+                    eprintln!("filter-merge: reusing stale candidates: {error}");
+                    let (lock, workspace) = stage(config)?;
+                    Build {
+                        workspace,
+                        output: candidate,
+                        stats: Stats::default(),
+                        _lock: lock,
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        (None, _) => build(config)?,
+    };
+    let exclude = config
+        .exclude_file
+        .as_deref()
+        .map(|path| NameSet::load(path, config.max_input_bytes))
+        .transpose()?;
+    if exclude.is_none() && observed.is_none() {
+        return Ok(build);
+    }
+    let trimmed = build.workspace.0.join("trimmed.txt");
+    let mut reader = BufReader::with_capacity(
+        8192,
+        File::open(&build.output).map_err(|_| "cannot open merged candidates")?,
+    );
+    let mut writer = BufWriter::with_capacity(8192, private_file(&trimmed)?);
+    let mut line = Vec::with_capacity(config.max_line_bytes + 2);
+    build.stats.rules = 0;
+    build.stats.output_bytes = 0;
+    while read_line(&mut reader, &mut line, config.max_line_bytes)? > 0 {
+        let rule = line.strip_suffix(b"\n").unwrap_or(&line);
+        let keep = adaptive::rule_domain(rule).is_none_or(|found| {
+            !(found.plain
+                && exclude
+                    .as_ref()
+                    .is_some_and(|set| set.contains(found.domain)))
+                && observed.is_none_or(|set| set.contains(found.domain))
+        });
+        if keep {
+            writer
+                .write_all(&line)
+                .map_err(|_| "cannot write trimmed list")?;
+            build.stats.rules += 1;
+            build.stats.output_bytes += line.len() as u64;
+        }
+    }
+    writer.flush().map_err(|_| "cannot flush trimmed list")?;
+    if build.stats.rules == 0 {
+        // An empty answer would wipe the resolver's list; fail so it keeps the last one.
+        return Err("trimmed list contains no rules".into());
+    }
+    build.output = trimmed;
+    Ok(build)
+}
+fn seen_path(config: &Config) -> Option<PathBuf> {
+    config.state_dir.as_ref().map(|dir| dir.join("seen.tsv"))
+}
 pub fn merge(config: &Config, output: &Path) -> Result<Stats> {
-    let build = build(config)?;
+    let observed = match (config.adaptive, seen_path(config)) {
+        (true, Some(path)) => Some(Seen::load(&path)?.suffixes(config.adaptive_min_queries)),
+        _ => None,
+    };
+    let build = produce(config, observed.as_ref())?;
     // Same-directory temporary output makes publication atomic across filesystems.
     let parent = output
         .parent()
@@ -584,8 +759,93 @@ fn send_build(stream: &mut TcpStream, result: &Result<Build>) {
         }
     }
 }
-fn cheap_request(stream: &mut TcpStream, path: &str, head: bool) -> bool {
+#[derive(Default)]
+struct State {
+    seen: Seen,
+    polls: u64,
+    entries: u64,
+    errors: u64,
+    gaps: u64,
+    refreshes: u64,
+    last_error: String,
+}
+type Shared = Arc<Mutex<State>>;
+fn locked(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+/// Poll the query log forever; flush the store and nudge AdGuard on a schedule.
+fn observe(config: Config, shared: Shared, mut observer: Observer, store: PathBuf) {
+    let mut last_flush = Instant::now();
+    let mut last_refresh = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_secs(config.observe_interval_secs));
+        let mut state = locked(&shared);
+        state.polls += 1;
+        match observer.poll(&mut state.seen) {
+            Ok(poll) => {
+                state.entries += poll.entries as u64;
+                state.gaps += u64::from(poll.gap);
+            }
+            Err(error) => {
+                state.errors += 1;
+                state.last_error = error;
+            }
+        }
+        if last_flush.elapsed().as_secs() >= config.state_flush_secs {
+            last_flush = Instant::now();
+            state.seen.prune(
+                adaptive::today(),
+                config.seen_max_age_days,
+                config.seen_max_entries,
+            );
+            if state.seen.dirty {
+                if let Err(error) = state.seen.save(&store) {
+                    state.errors += 1;
+                    state.last_error = error;
+                }
+            }
+        }
+        let refresh = config.adaptive
+            && state.seen.fresh
+            && last_refresh.elapsed().as_secs() >= config.refresh_secs;
+        // AdGuard fetches from this process while refreshing; never hold the lock.
+        drop(state);
+        if refresh {
+            last_refresh = Instant::now();
+            let result = observer.refresh_filters();
+            let mut state = locked(&shared);
+            state.refreshes += 1;
+            if let Err(error) = result {
+                state.errors += 1;
+                state.last_error = error;
+            }
+        }
+    }
+}
+fn cheap_request(stream: &mut TcpStream, path: &str, head: bool, shared: Option<&Shared>) -> bool {
     match path {
+        "/stats" => {
+            let body = match shared {
+                Some(shared) => {
+                    let state = locked(shared);
+                    format!(
+                        "observed_names={}\npolls={}\nentries={}\ngaps={}\nrefreshes={}\nerrors={}\nlast_error={}\n",
+                        state.seen.len(),
+                        state.polls,
+                        state.entries,
+                        state.gaps,
+                        state.refreshes,
+                        state.errors,
+                        state.last_error
+                    )
+                }
+                None => "observation disabled\n".to_string(),
+            };
+            let _ = response(stream, "200 OK", body.as_bytes(), head);
+            true
+        }
         "/healthz" | "/version" => {
             let _ = response(
                 stream,
@@ -608,6 +868,27 @@ fn cheap_request(stream: &mut TcpStream, path: &str, head: bool) -> bool {
 }
 pub fn serve(config: Config) -> Result<()> {
     let listener = TcpListener::bind(config.listen).map_err(|_| "cannot bind listener")?;
+    let shared = match &config.state_dir {
+        Some(directory) => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory)
+                .map_err(|_| "cannot create state directory")?;
+            let store = directory.join("seen.tsv");
+            let shared: Shared = Arc::new(Mutex::new(State {
+                seen: Seen::load(&store)?,
+                ..State::default()
+            }));
+            if let Some(api) = &config.adguard_api {
+                let observer = Observer::new(api, config.glinet_session, directory)?;
+                let (config, shared) = (config.clone(), shared.clone());
+                std::thread::spawn(move || observe(config, shared, observer, store));
+            }
+            Some(shared)
+        }
+        None => None,
+    };
     eprintln!("filter-merge {VERSION}: listening on {}", config.listen);
     loop {
         listener
@@ -621,10 +902,19 @@ pub fn serve(config: Config) -> Result<()> {
                 continue;
             }
         };
-        if cheap_request(&mut stream, &path, head) {
+        if cheap_request(&mut stream, &path, head, shared.as_ref()) {
             continue;
         }
-        let result = build(&config);
+        let observed = match (&shared, config.adaptive) {
+            (Some(shared), true) => {
+                let mut state = locked(shared);
+                state.seen.fresh = false;
+                Some(state.seen.suffixes(config.adaptive_min_queries))
+            }
+            _ => None,
+        };
+        let result = produce(&config, observed.as_ref());
+        drop(observed);
         if let Ok(build) = &result {
             eprintln!(
                 "filter-merge: input_bytes={} rules={} output_bytes={}",
@@ -641,7 +931,7 @@ pub fn serve(config: Config) -> Result<()> {
             match listener.accept() {
                 Ok((mut queued, _)) => match request(&mut queued) {
                     Ok((path, head)) => {
-                        if !cheap_request(&mut queued, &path, head) {
+                        if !cheap_request(&mut queued, &path, head, shared.as_ref()) {
                             send_build(&mut queued, &result);
                         }
                     }

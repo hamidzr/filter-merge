@@ -121,7 +121,7 @@ storage to avoid moving the staging cost into RAM. Flash writes occur on each
 fetch; frequent manual fetches increase wear. No permanent server-side cache is
 kept; AdGuard stores its downloaded copy.
 
-The service is single-threaded. Health checks wait for an active build. It is
+Requests are served by one thread; the observer, when enabled, runs on a second. Health checks wait for an active build. It is
 intended for a local AdGuard process, not a public HTTP endpoint.
 
 ## OpenWrt installation
@@ -171,17 +171,71 @@ Check logs with `logread -e filter-merge`. Restart after configuration edits wit
 subscriptions, update them successfully, then disable the merged subscription
 and stop/disable this service. No automated AdGuard YAML editing is required.
 
+## Trimming: exclude list and adaptive mode
+
+Both are optional. Without these keys the service behaves as described above.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `exclude_file` | unset | Domains, one per line; their plain block rules are dropped |
+| `state_dir` | unset | Absolute directory for the observed-name store |
+| `adguard_api` | unset | `http://127.0.0.1:3000`; setting it starts the observer |
+| `glinet_session` | `0` | `1` on GL.iNet firmware, whose AdGuard build uses the router login |
+| `observe_interval_secs` | `60` | Query-log polling period |
+| `state_flush_secs` | `3600` | How often the store is written to disk |
+| `adaptive` | `0` | `1` serves only rules that can match an observed name |
+| `adaptive_min_queries` | `1` | Queries a name needs before its rules are served |
+| `seen_max_age_days` | `0` | Forget names not seen for this long; `0` keeps them |
+| `seen_max_entries` | `200000` | Store cap; least recently seen names go first |
+| `candidate_max_age_hours` | `168` | Re-download sources after this long in adaptive mode |
+| `refresh_secs` | `3600` | Shortest gap between AdGuard refresh requests |
+
+**Exclude list.** A rule is dropped only when it is a plain `||domain^`, hosts or
+bare-domain rule and its domain is listed. Exceptions and rules with modifiers
+stay. Use it for domains that no longer resolve, or that a parent rule already
+covers.
+
+**Observer.** Each poll reads AdGuard Home's query log and records every queried
+name and every CNAME target in `state_dir/seen.tsv`: name, first day, last day,
+query count and blocked count, as days since 1970. No client addresses are kept.
+`.lan`, `.local`, `.internal` and `.arpa` names are skipped. The file is still a
+browsing history of the network, so it is written with mode 0600; treat backups
+of it the same way. With `file_enabled: false`, AdGuard keeps only its last
+`size_memory` queries (1000 by default). If more arrive between polls, some are
+missed and `/stats` counts a gap. The first poll after a restart recounts the
+entries still in that buffer.
+
+**Adaptive mode.** A resolver only needs rules for names its clients ask for, so
+a 400,000-rule merge usually shrinks to a few thousand rules and AdGuard's memory
+drops with it. A rule is served when its domain is an observed name or a parent
+of one. Rules without a plain domain (regexes, wildcards) are always served.
+The full merge is cached as `work_dir/candidate.txt`. When new names have been
+recorded, the observer asks AdGuard to refresh, at most once per `refresh_secs`,
+and AdGuard reloads only if the list changed.
+
+The cost is the first query: a name nobody on the network has asked for before
+is not blocked until the next refresh picks it up. Run the observer alone for a
+while before setting `adaptive=1`, and preview the result with
+`merge CONFIG OUTPUT --adaptive`. An adaptive build with no surviving rules
+fails with 502, so AdGuard keeps its previous list.
+
+`glinet_session=1` writes a session file under `/tmp/gl_token_*`, which is how
+GL.iNet's AdGuard build recognises a logged-in admin. Stock AdGuard Home with
+its own users configured is not supported yet; without users it needs no login.
+`adguard_api` must be a loopback `http://` address.
+
 ## CLI and endpoints
 
 ```sh
 filter-merge --version
 filter-merge serve CONFIG
 filter-merge merge CONFIG OUTPUT
+filter-merge merge CONFIG OUTPUT --adaptive   # preview; needs state_dir
 ```
 
 CLI export replaces OUTPUT atomically after success. `/filters.txt` builds and
 serves the list. `/healthz` and `/version` expose health/build identity without
-fetching sources. HEAD does not rebuild. Version includes semver, Git revision,
+fetching sources. `/stats` reports observer counters. HEAD does not rebuild. Version includes semver, Git revision,
 and UTC build date. Optional `SOURCE_DATE_EPOCH` supplies reproducible build time.
 
 ## Tests and measurements
