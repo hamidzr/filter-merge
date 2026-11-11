@@ -39,6 +39,8 @@ pub struct Config {
     pub urls: Vec<String>,
     /// Domains whose plain rules are dropped from the output.
     pub exclude_file: Option<PathBuf>,
+    /// Local rules appended to the output as written; never trimmed.
+    pub extra_file: Option<PathBuf>,
     /// Holds the observed-domain store; required for observation.
     pub state_dir: Option<PathBuf>,
     /// AdGuard Home base URL; setting it turns observation on.
@@ -72,6 +74,7 @@ impl Default for Config {
             build_timeout_secs: 55,
             urls: Vec::new(),
             exclude_file: None,
+            extra_file: None,
             state_dir: None,
             adguard_api: None,
             glinet_session: false,
@@ -136,6 +139,7 @@ impl Config {
                 "download_timeout_secs" => number!(download_timeout_secs),
                 "build_timeout_secs" => number!(build_timeout_secs),
                 "exclude_file" => config.exclude_file = Some(value.into()),
+                "extra_file" => config.extra_file = Some(value.into()),
                 "state_dir" => config.state_dir = Some(value.into()),
                 "adguard_api" => config.adguard_api = Some(value.into()),
                 "glinet_session" => config.glinet_session = flag()?,
@@ -196,12 +200,12 @@ impl Config {
         if !config.work_dir.is_absolute() {
             return Err("work_dir must be absolute".into());
         }
-        if [&config.exclude_file, &config.state_dir]
+        if [&config.exclude_file, &config.extra_file, &config.state_dir]
             .into_iter()
             .flatten()
             .any(|path| !path.is_absolute())
         {
-            return Err("exclude_file and state_dir must be absolute".into());
+            return Err("exclude_file, extra_file and state_dir must be absolute".into());
         }
         if let Some(api) = &config.adguard_api {
             // The observer sends a session cookie; never let it leave the host.
@@ -641,7 +645,7 @@ fn produce(config: &Config, observed: Option<&NameSet>) -> Result<Build> {
         (None, _) => build(config)?,
     };
     let exclude = load_exclude(config)?;
-    if exclude.is_none() && observed.is_none() {
+    if exclude.is_none() && observed.is_none() && config.extra_file.is_none() {
         return Ok(build);
     }
     let trimmed = build.workspace.0.join("trimmed.txt");
@@ -665,6 +669,15 @@ fn produce(config: &Config, observed: Option<&NameSet>) -> Result<Build> {
             build.stats.output_bytes += line.len() as u64;
         }
     }
+    let stats = &mut build.stats;
+    extra_rules(config, |line| {
+        stats.fingerprint = fnv(stats.fingerprint, line);
+        stats.rules += 1;
+        stats.output_bytes += line.len() as u64;
+        writer
+            .write_all(line)
+            .map_err(|_| "cannot write trimmed list".into())
+    })?;
     writer.flush().map_err(|_| "cannot flush trimmed list")?;
     if build.stats.rules == 0 {
         // An empty answer would wipe the resolver's list; fail so it keeps the last one.
@@ -678,6 +691,25 @@ fn keeps(rule: &[u8], exclude: Option<&NameSet>, observed: Option<&NameSet>) -> 
         !(found.plain && exclude.is_some_and(|set| set.contains(found.domain)))
             && observed.is_none_or(|set| set.contains(found.domain))
     })
+}
+/// Feed each rule of `extra_file` to `sink`, newline-terminated.
+fn extra_rules(config: &Config, mut sink: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let Some(path) = &config.extra_file else {
+        return Ok(());
+    };
+    let file = File::open(path).map_err(|_| "cannot open extra_file")?;
+    let mut reader = BufReader::with_capacity(8192, file);
+    let mut line = Vec::with_capacity(config.max_line_bytes + 2);
+    while read_line(&mut reader, &mut line, config.max_line_bytes)? > 0 {
+        let text = line.trim_ascii();
+        if text.is_empty() || matches!(text[0], b'!' | b'#') {
+            continue;
+        }
+        let mut rule = text.to_vec();
+        rule.push(b'\n');
+        sink(&rule)?;
+    }
+    Ok(())
 }
 fn load_exclude(config: &Config) -> Result<Option<NameSet>> {
     config
@@ -708,6 +740,10 @@ fn adaptive_fingerprint(config: &Config, observed: &NameSet) -> Result<Option<u6
             hash = fnv(hash, &line);
         }
     }
+    extra_rules(config, |line| {
+        hash = fnv(hash, line);
+        Ok(())
+    })?;
     Ok(Some(hash))
 }
 /// Names whose rules adaptive mode serves today.

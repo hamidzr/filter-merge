@@ -190,6 +190,18 @@ def main() -> None:
         ], output.read_text()
         results.append("exclude list drops plain rules only")
 
+        extra = root / "extra.txt"
+        extra.write_text("! mine\n\n||manual.example^\n||z.example^")
+        configure(
+            ["/a", "/b"], extra=f"exclude_file={exclude}\nextra_file={extra}\n"
+        )
+        merge_ok()
+        assert output.read_text().splitlines()[-2:] == [
+            "||manual.example^",
+            "||z.example^",
+        ], output.read_text()
+        results.append("extra file is appended and survives the exclude list")
+
         state = root / "state"
 
         def entry(stamp: int, name: str, reason: str, cname: str = "") -> dict:

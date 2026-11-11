@@ -178,6 +178,7 @@ Both are optional. Without these keys the service behaves as described above.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `exclude_file` | unset | Domains, one per line; their plain block rules are dropped |
+| `extra_file` | unset | Your own rules, one per line; appended as written and never trimmed |
 | `state_dir` | unset | Absolute directory for the observed-name store |
 | `adguard_api` | unset | `http://127.0.0.1:3000`; setting it starts the observer |
 | `glinet_session` | `0` | `1` on GL.iNet firmware, whose AdGuard build uses the router login |
