@@ -17,7 +17,7 @@ Other router architectures still require a source build. On OpenWrt, run as root
 with curl and CA certificates installed:
 
 ```sh
-curl -fsSL https://github.com/hamidzr/filter-merge/releases/download/v0.1.1/install.sh | sh -s -- --url https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
+curl -fsSL https://github.com/hamidzr/filter-merge/releases/download/v0.2.0/install.sh | sh -s -- --url https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
 ```
 
 Repeat `--url URL` for each of your existing subscriptions. Installer verifies

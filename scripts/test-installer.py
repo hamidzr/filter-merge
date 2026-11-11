@@ -34,7 +34,7 @@ cp "$FIXTURE/${url##*/}" "$output"
 """)
         for file in mock.iterdir():
             file.chmod(0o755)
-        archive = root / "filter-merge-v0.1.1-aarch64-linux-musl.tar.gz"
+        archive = root / "filter-merge-v0.2.0-aarch64-linux-musl.tar.gz"
         with tarfile.open(archive, "w:gz") as tar:
             for path, name in [
                 (binary, "filter-merge"),
